@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.pyc
+
+# Results that can be recomputed
+cache_*.pkl
+cache_*.npz
+images/
+out_*.txt
+
+# Editor
+.vscode/
