@@ -1,0 +1,138 @@
+# nw_loop_levels_fast.py
+# SAME loop as nw_loop_levels.py (same rule for times, ties, episodes), but the
+# Kirchhoff step uses nw_solver_fast.FastKirchhoff: the matrix is factorised
+# only every maxupd changed junctions (default 50) and the voltages are
+# corrected in between. Measured on this machine: about 7-10 times faster.
+# The sequence of switches is NOT always identical to the original: when two
+# switches are (numerically) simultaneous, rounding at the 1e-15 level can pick
+# the other one first. The statistics (number of avalanches, tau) agree.
+# Original header follows.
+#
+# (original) nw_loop_levels.py
+# Event-driven loop at fixed external voltage. Each junction has K conductance
+# LEVELS (K = 1: two states, OFF and ON).
+#   level k = 0, 1, ..., K ; conductance G_k = Goff * (Gon/Goff)^(k/K)
+#   (exponential growth, a crude version of the tunnelling regime)
+# At every iteration: Kirchhoff, fill rate r_i = max(|V_i| - Vset, 0), time to
+# the NEXT level t_i = ((k_i + 1) * Lcrit / K - L_i) / r_i, the smallest time
+# wins, all buckets advance, that junction goes up ONE level.
+# A junction at level K is ON (it does not move any more).
+# Why levels: when a junction rises one level its own drop falls, so its fill
+# rate falls too (it "waits" near Vset, as in Hochstetter's model).
+#
+# Growth EPISODES (Hochstetter counts one event per episode of rising
+# conductance of a junction): an episode starts at the first level step of a
+# junction and goes on while its drop stays above Vset (rate > 0). If at any
+# loop iteration its rate is 0 (plateau), the episode is over; the next level
+# step of that junction starts a NEW episode. event_new_episode[k] is True
+# when step k starts a new episode.
+# A plateau is counted only if the clock really advances while the rate is 0:
+# junctions with the same switching time (ties) are processed one after the
+# other with dt = 0, and that is NOT a pause.
+#
+# Example (K = 2, chain S-M-D, both junctions at level 0, V = 0.04):
+#   drops 0.02 -> r = 0.01 each; level thresholds are Lcrit/2 = 0.005 and 0.01.
+#   t0 = t1 = 0.005/0.01 = 0.5 (tie): j0 goes to level 1 first (lowest index).
+#   Now G0 = Goff*sqrt(1000) = 0.0316 -> j0 drop falls, j1 drop rises:
+#   j1 then reaches its level 1 shortly after, and so on.
+#   Episode flags of this example: [True, True, False, False] (each junction
+#   grows in one episode; the tie does not create a false pause).
+
+import numpy as np
+
+from nw_current import make_current_meter
+
+from nw_solver import junction_drops
+from nw_solver_fast import FastKirchhoff
+
+TIE_TOLERANCE = 1.0e-9
+
+
+def run_loop_levels_fast(n_nodes, junctions, sources, drains, v_ext,
+                         v_set, lam_crit, g_off, g_on, n_levels,
+                         max_steps=2000000, maxupd=50):
+    # Returns a dict: event_time, event_junction, event_level (level reached),
+    # level (final level of every junction), is_on (level == K), lam, clock,
+    # state_current, state_conductance, state_time (see the end of the function).
+    m = junctions.shape[0]
+    K = int(n_levels)
+    step = lam_crit / K
+    level = np.zeros(m, dtype=int)
+    lam = np.zeros(m, dtype=float)
+    interrupted = np.zeros(m, dtype=bool)   # plateau seen since last step
+    event_new = []
+    # conductance of each level
+    level_g = np.zeros(K + 1, dtype=float)
+    for k in range(K + 1):
+        level_g[k] = g_off * (g_on / g_off) ** (float(k) / K)
+
+    # fast Kirchhoff solver: factorises once in a while, corrects in between
+    solver = FastKirchhoff(n_nodes, junctions, sources, drains, v_ext,
+                           level_g[level], maxupd)
+
+    # corrente totale in ogni stato della rete (stato 0 = inizio, poi dopo ogni scatto)
+    meter = make_current_meter(n_nodes, junctions, sources)
+    current_state = []
+
+    clock = 0.0
+    event_time = []
+    event_junction = []
+    event_level = []
+    n_steps = 0
+    while n_steps < max_steps:
+        n_steps = n_steps + 1
+        voltage = solver.solve()
+        current_state.append(meter(voltage, level_g[level]))
+        drop = np.abs(junction_drops(junctions, voltage))
+        movable = level < K
+        rate = np.where(movable, np.maximum(drop - v_set, 0.0), 0.0)
+        # a junction that has started to rise but now has rate 0 is on a plateau
+        stalled = (rate <= 0.0) & movable & (level > 0)
+        t = np.full(m, np.inf)
+        positive = rate > 0.0
+        next_threshold = (level + 1) * step
+        t[positive] = (next_threshold[positive] - lam[positive]) / rate[positive]
+        if not np.any(np.isfinite(t)):
+            break
+        dt = np.min(t)
+        tied = np.nonzero(t <= dt + TIE_TOLERANCE * dt + 1.0e-15)[0]
+        i_star = int(tied[0])
+        # A plateau counts only if time really passes while the rate is 0.
+        # If dt is (almost) zero, this switch is simultaneous with the previous
+        # one (tie, processed one after the other): no real pause happened.
+        if dt > TIE_TOLERANCE * clock + 1.0e-15:
+            interrupted[stalled] = True
+        lam[movable] = lam[movable] + rate[movable] * dt
+        clock = clock + dt
+        # new episode if first step of this junction, or it had a plateau
+        if level[i_star] == 0:
+            is_new = True
+        else:
+            is_new = bool(interrupted[i_star])
+        interrupted[i_star] = False
+        event_new.append(is_new)
+        # junction i* goes up one level; its Lambda is set exactly
+        level[i_star] = level[i_star] + 1
+        lam[i_star] = level[i_star] * step
+        solver.update_junction(i_star, level_g[level[i_star]])
+        event_time.append(clock)
+        event_junction.append(i_star)
+        event_level.append(int(level[i_star]))
+
+    out = {}
+    out["event_time"] = np.array(event_time, dtype=float)
+    out["event_junction"] = np.array(event_junction, dtype=int)
+    out["event_level"] = np.array(event_level, dtype=int)
+    out["event_new_episode"] = np.array(event_new, dtype=bool)
+    out["level"] = level
+    out["is_on"] = level == K
+    out["lam"] = lam
+    out["clock"] = clock
+    # Conducibilita' della rete G = I / V_ext. Un valore per ogni STATO:
+    # stato 0 = prima di qualunque scatto, stato k = dopo lo scatto k.
+    # Il tempo di ogni stato e' state_time (stato 0 al tempo 0).
+    n_states = len(current_state)
+    out["state_current"] = np.array(current_state, dtype=float)
+    out["state_conductance"] = out["state_current"] / v_ext
+    out["state_time"] = np.concatenate([[0.0], out["event_time"]])[:n_states]
+    return out

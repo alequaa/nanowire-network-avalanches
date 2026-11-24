@@ -1,0 +1,6 @@
+pycache/
+*.pyc
+*.pkl
+*.npz
+*.png
+old_cache/
